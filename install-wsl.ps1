@@ -465,7 +465,7 @@ EOF
 '@ -replace "`r`n", "`n"
 
         $bootB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootstrapScript))
-        $bootExit = Invoke-WslStream @("-d", $targetDistro, "-u", "root", "--", "bash", "-c", 'base64 -d | bash -s -- "$1"', "_", $effectiveLinuxUser) $bootB64
+        $bootExit = Invoke-WslStream @("-d", $targetDistro, "-u", "root", "--", "bash", "-c", 'base64 -di | bash -s -- "$1"', "_", $effectiveLinuxUser) $bootB64
         if ($bootExit -ne 0) {
             Write-Err "Failed to bootstrap Linux user '$effectiveLinuxUser' in '$targetDistro' (exit code $bootExit)."
             return $bootExit
@@ -520,9 +520,9 @@ EOF
         $scriptContent = (Invoke-RestMethod -Uri $RepoUrl) -replace "`r`n", "`n"
     }
 
-    # 6. Execute install.sh inside WSL via base64 (immune to PowerShell CR/encoding mangling)
+    # 6. Execute install.sh inside WSL via base64 -di (immune to PowerShell CR/encoding mangling)
     $scriptB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($scriptContent))
-    $wslArgs = $wslPrefix + @("--", "env") + $envArgs + @("bash", "-c", "base64 -d | bash -s")
+    $wslArgs = $wslPrefix + @("--", "env") + $envArgs + @("bash", "-c", "base64 -di | bash -s")
     $runExit = Invoke-WslStream $wslArgs $scriptB64
     if ($runExit -ne 0) {
         Write-Err "Tryton installation inside WSL distro '$targetDistro' failed (exit code $runExit)."
