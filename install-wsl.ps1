@@ -93,11 +93,11 @@ function Invoke-WslStream([string[]]$Arguments, [string]$StdinText = $null) {
     $ErrorActionPreference = "Continue"
     try {
         if ($null -ne $StdinText) {
-            $StdinText | & $wslExe @Arguments
+            $StdinText | & $wslExe @Arguments | Out-Host
         } else {
-            & $wslExe @Arguments
+            & $wslExe @Arguments | Out-Host
         }
-        return $LASTEXITCODE
+        return [int]$LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref
     }

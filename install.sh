@@ -196,6 +196,18 @@ setup_sudo() {
     fi
 }
 
+run_as_postgres() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        if command -v runuser >/dev/null 2>&1; then
+            runuser -u postgres -- "$@"
+        else
+            sudo -u postgres "$@"
+        fi
+    else
+        sudo -u postgres "$@"
+    fi
+}
+
 check_os() {
     if [[ ! -f /etc/os-release ]]; then
         log_error "Unsupported OS: /etc/os-release not found."
@@ -360,7 +372,7 @@ ensure_pg_password_auth() {
     # Ensure localhost TCP connections accept scram-sha-256/md5 password auth
     # (so Tryton and Windows clients like pgAdmin/DBeaver connect to localhost:5432).
     local hba_file
-    hba_file="$($SUDO -u postgres psql -p "$PG_PORT" -tAc "SHOW hba_file;" 2>/dev/null || true)"
+    hba_file="$(run_as_postgres psql -p "$PG_PORT" -tAc "SHOW hba_file;" 2>/dev/null || true)"
     if [[ -z "$hba_file" || ! -f "$hba_file" ]]; then
         return
     fi
@@ -368,7 +380,7 @@ ensure_pg_password_auth() {
     if ! $SUDO grep -Eq '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32[[:space:]]+(scram-sha-256|md5)' "$hba_file"; then
         log_info "Enabling password authentication for 127.0.0.1/32 in $hba_file..."
         printf '\n# Added by tryton-wsl-installer for localhost TCP clients\nhost all all 127.0.0.1/32 scram-sha-256\nhost all all ::1/128 scram-sha-256\n' | $SUDO tee -a "$hba_file" >/dev/null
-        $SUDO -u postgres psql -p "$PG_PORT" -c "SELECT pg_reload_conf();" >/dev/null
+        run_as_postgres psql -p "$PG_PORT" -c "SELECT pg_reload_conf();" >/dev/null
     fi
 }
 
@@ -399,18 +411,18 @@ setup_postgres() {
     log_info "Configuring least-privilege PostgreSQL role '${PG_USER}' and database '${PG_DB}'..."
     # Parameterized psql variables via heredoc prevent SQL injection on identifiers/literals.
     local role_exists
-    role_exists="$($SUDO -u postgres psql -p "$PG_PORT" -tA -v pg_user="$PG_USER" <<'SQL'
+    role_exists="$(run_as_postgres psql -p "$PG_PORT" -tA -v pg_user="$PG_USER" <<'SQL'
 SELECT 1 FROM pg_roles WHERE rolname = :'pg_user';
 SQL
 )"
     if [[ "$role_exists" == "1" ]]; then
-        $SUDO -u postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
+        run_as_postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
             -v pg_user="$PG_USER" \
             -v pg_pass="$PG_PASSWORD" <<'SQL' >/dev/null
 ALTER ROLE :"pg_user" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'pg_pass';
 SQL
     else
-        $SUDO -u postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
+        run_as_postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
             -v pg_user="$PG_USER" \
             -v pg_pass="$PG_PASSWORD" <<'SQL' >/dev/null
 CREATE ROLE :"pg_user" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD :'pg_pass';
@@ -418,12 +430,12 @@ SQL
     fi
 
     local db_exists
-    db_exists="$($SUDO -u postgres psql -p "$PG_PORT" -tA -v pg_db="$PG_DB" <<'SQL'
+    db_exists="$(run_as_postgres psql -p "$PG_PORT" -tA -v pg_db="$PG_DB" <<'SQL'
 SELECT 1 FROM pg_database WHERE datname = :'pg_db';
 SQL
 )"
     if [[ "$db_exists" != "1" ]]; then
-        $SUDO -u postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
+        run_as_postgres psql -p "$PG_PORT" -v ON_ERROR_STOP=1 \
             -v pg_db="$PG_DB" \
             -v pg_user="$PG_USER" <<'SQL' >/dev/null
 CREATE DATABASE :"pg_db" OWNER :"pg_user" ENCODING 'UTF8';
