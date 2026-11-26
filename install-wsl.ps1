@@ -3,7 +3,7 @@
     Non-interactive Windows PowerShell launcher for installing Tryton on WSL (Ubuntu/Debian).
 
 .DESCRIPTION
-    Automatically manages WSL distro installation if the target distro does not exist yet
+    Automatically installs WSL (if not yet enabled) and the target Ubuntu/Debian distro
     (no manual `wsl --install` or Linux username/password popup required).
 
     Quick start (default Tryton 7.2):
@@ -56,17 +56,62 @@ function Write-Ok([string]$Msg)   { Write-Host "[ OK ] $Msg" -ForegroundColor Gr
 function Write-Warn([string]$Msg) { Write-Host "[WARN] $Msg" -ForegroundColor Yellow }
 function Write-Err([string]$Msg)  { Write-Host "[ERR ] $Msg" -ForegroundColor Red }
 
+function Invoke-WslCapture([string[]]$Arguments) {
+    # PowerShell 5.1 throws NativeCommandError on stderr redirects when ErrorActionPreference=Stop.
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = (& wsl.exe @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+    $lines = @($output | ForEach-Object { ("$_" -replace "`0", "").TrimEnd() })
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Lines    = $lines
+        Text     = ($lines -join "`n").Trim()
+    }
+}
+
+function Invoke-WslStream([string[]]$Arguments, [string]$StdinText = $null) {
+    $prevPref = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($null -ne $StdinText) {
+            $StdinText | & wsl.exe @Arguments
+        } else {
+            & wsl.exe @Arguments
+        }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevPref
+    }
+}
+
+function Test-IsAdministrator {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Get-InstalledWslDistros {
-    $raw = (& wsl.exe --list --quiet 2>$null)
-    return @($raw | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ -ne "" })
+    $res = Invoke-WslCapture @("--list", "--quiet")
+    if ($res.ExitCode -ne 0) {
+        return @()
+    }
+    return @($res.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
 }
 
 function Get-OnlineWslDistros {
-    $raw = (& wsl.exe --list --online 2>$null)
+    $res = Invoke-WslCapture @("--list", "--online")
+    if ($res.ExitCode -ne 0) {
+        return @()
+    }
     $names = @()
     $inTable = $false
-    foreach ($line in $raw) {
-        $clean = ($line -replace "`0", "").Trim()
+    foreach ($line in $res.Lines) {
+        $clean = $line.Trim()
         if ($clean -match '^NAME\s+FRIENDLY NAME') {
             $inTable = $true
             continue
@@ -89,116 +134,147 @@ function Resolve-LinuxUsername([string]$Requested) {
     return $candidate
 }
 
-# 1. Validate inputs before touching WSL
-if ($BaseDistro -notmatch '^[a-zA-Z0-9._-]+$') {
-    Write-Err "Invalid BaseDistro '$BaseDistro'."
-    exit 1
-}
-if ($Distro -and $Distro -notmatch '^[a-zA-Z0-9._-]+$') {
-    Write-Err "Invalid Distro '$Distro'."
-    exit 1
-}
-if ($LinuxUser -and ($LinuxUser -eq "root" -or $LinuxUser -notmatch '^[a-z_][a-z0-9_-]{0,31}$')) {
-    Write-Err "Invalid LinuxUser '$LinuxUser'. Use a lowercase Linux username (not root)."
-    exit 1
-}
-if ($TrytonSeries -ne "latest" -and $TrytonSeries -notmatch '^\d+\.\d+$') {
-    Write-Err "Invalid TrytonSeries '$TrytonSeries'. Expected 'latest' or 'X.Y' (e.g. 7.2)."
-    exit 1
-}
-if ($TrytonPort -lt 1024 -or $TrytonPort -gt 65535) {
-    Write-Err "Invalid TrytonPort '$TrytonPort'. Must be between 1024 and 65535."
-    exit 1
-}
-if ($null -ne $PgPort -and ($PgPort -lt 1 -or $PgPort -gt 65535)) {
-    Write-Err "Invalid PgPort '$PgPort'. Must be between 1 and 65535."
-    exit 1
-}
-if ($PgUser -notmatch '^[a-z_][a-z0-9_]{0,62}$') {
-    Write-Err "Invalid PgUser '$PgUser'."
-    exit 1
-}
-if ($PgDb -notmatch '^[a-z_][a-z0-9_]{0,62}$') {
-    Write-Err "Invalid PgDb '$PgDb'."
-    exit 1
-}
-if ($PgHost -and $PgHost -notmatch '^[a-zA-Z0-9._:-]+$') {
-    Write-Err "Invalid PgHost '$PgHost'."
-    exit 1
-}
-if ($PgHost -and -not $PgPassword) {
-    Write-Err "PgPassword is required when PgHost is specified."
-    exit 1
-}
+function Invoke-TrytonWslMain {
+    $isDryRun = ($DryRun -or $env:DRY_RUN -eq "1")
 
-# 2. Verify WSL is available
-if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
-    Write-Err "wsl.exe was not found on this Windows machine."
-    Write-Host "Enable WSL from an elevated PowerShell prompt, reboot, then re-run this script:"
-    Write-Host "  wsl --install --no-distribution" -ForegroundColor Yellow
-    exit 1
-}
-
-$installedDistros = Get-InstalledWslDistros
-$targetDistro = $Distro
-$provisionedNewDistro = $false
-$effectiveLinuxUser = $null
-
-# Determine target distro:
-# - If -Distro / WSL_DISTRO is set, ensure that distro exists (auto-install if missing).
-# - If not set and a distro already exists, use the existing default distro.
-# - If not set and NO distro exists, auto-install $BaseDistro.
-if (-not $targetDistro) {
-    if ($installedDistros.Count -gt 0) {
-        $targetDistro = $installedDistros[0]
-        Write-Info "Using existing default WSL distro: $targetDistro"
-    } else {
-        $targetDistro = $BaseDistro
+    # 1. Validate inputs before touching WSL
+    if ($BaseDistro -notmatch '^[a-zA-Z0-9._-]+$') {
+        Write-Err "Invalid BaseDistro '$BaseDistro'."
+        return 1
     }
-}
-
-# 3. Auto-install target distro if it is not installed yet
-if ($installedDistros -notcontains $targetDistro) {
-    $onlineDistros = Get-OnlineWslDistros
-    $imageToInstall = $BaseDistro
-    if ($onlineDistros -contains $targetDistro -and -not $env:WSL_BASE_DISTRO -and -not $PSBoundParameters.ContainsKey('BaseDistro')) {
-        $imageToInstall = $targetDistro
+    if ($Distro -and $Distro -notmatch '^[a-zA-Z0-9._-]+$') {
+        Write-Err "Invalid Distro '$Distro'."
+        return 1
+    }
+    if ($LinuxUser -and ($LinuxUser -eq "root" -or $LinuxUser -notmatch '^[a-z_][a-z0-9_-]{0,31}$')) {
+        Write-Err "Invalid LinuxUser '$LinuxUser'. Use a lowercase Linux username (not root)."
+        return 1
+    }
+    if ($TrytonSeries -ne "latest" -and $TrytonSeries -notmatch '^\d+\.\d+$') {
+        Write-Err "Invalid TrytonSeries '$TrytonSeries'. Expected 'latest' or 'X.Y' (e.g. 7.2)."
+        return 1
+    }
+    if ($TrytonPort -lt 1024 -or $TrytonPort -gt 65535) {
+        Write-Err "Invalid TrytonPort '$TrytonPort'. Must be between 1024 and 65535."
+        return 1
+    }
+    if ($null -ne $PgPort -and ($PgPort -lt 1 -or $PgPort -gt 65535)) {
+        Write-Err "Invalid PgPort '$PgPort'. Must be between 1 and 65535."
+        return 1
+    }
+    if ($PgUser -notmatch '^[a-z_][a-z0-9_]{0,62}$') {
+        Write-Err "Invalid PgUser '$PgUser'."
+        return 1
+    }
+    if ($PgDb -notmatch '^[a-z_][a-z0-9_]{0,62}$') {
+        Write-Err "Invalid PgDb '$PgDb'."
+        return 1
+    }
+    if ($PgHost -and $PgHost -notmatch '^[a-zA-Z0-9._:-]+$') {
+        Write-Err "Invalid PgHost '$PgHost'."
+        return 1
+    }
+    if ($PgHost -and -not $PgPassword) {
+        Write-Err "PgPassword is required when PgHost is specified."
+        return 1
     }
 
-    if ($DryRun -or $env:DRY_RUN -eq "1") {
-        if ($targetDistro -ne $imageToInstall) {
-            Write-Info "[DRY-RUN] Would run: wsl.exe --install $imageToInstall --name $targetDistro --no-launch"
-        } else {
-            Write-Info "[DRY-RUN] Would run: wsl.exe --install $imageToInstall --no-launch"
+    # 2. Verify WSL is installed (and auto-install it on clean Windows machines)
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+        Write-Err "wsl.exe was not found on this Windows machine (requires Windows 10 2004+ or Windows 11)."
+        return 1
+    }
+
+    # Clean Windows ships a stub System32\wsl.exe; `wsl.exe --status` returns non-zero until WSL is installed.
+    $status = Invoke-WslCapture @("--status")
+    if ($status.ExitCode -ne 0) {
+        Write-Warn "Windows Subsystem for Linux (WSL) is not installed yet on this machine."
+        if ($isDryRun) {
+            Write-Info "[DRY-RUN] Would run: wsl.exe --install --no-distribution"
+            return 0
         }
-        Write-Info "[DRY-RUN] Would bootstrap Linux user '$(Resolve-LinuxUsername $LinuxUser)' and run install.sh."
-        exit 0
+
+        if (-not (Test-IsAdministrator)) {
+            Write-Err "Administrator privileges are required to install WSL for the first time."
+            Write-Host "Right-click PowerShell -> 'Run as Administrator', then re-run this exact same command." -ForegroundColor Yellow
+            return 1
+        }
+
+        Write-Info "Installing WSL automatically (wsl.exe --install --no-distribution)..."
+        $installExit = Invoke-WslStream @("--install", "--no-distribution")
+        if ($installExit -ne 0 -and $installExit -ne 3010) {
+            Write-Err "WSL installation returned exit code $installExit."
+            Write-Host "Try running 'wsl.exe --install --no-distribution' manually as Administrator, reboot, and re-run this command." -ForegroundColor Yellow
+            return $installExit
+        }
+
+        $after = Invoke-WslCapture @("--status")
+        if ($after.ExitCode -ne 0) {
+            Write-Ok "WSL has been installed!"
+            Write-Warn "Windows requires a reboot to finish enabling WSL2."
+            Write-Host "Please reboot Windows, then re-run this exact same command to install $BaseDistro and Tryton." -ForegroundColor Yellow
+            return 0
+        }
+
+        Write-Ok "WSL is installed and ready!"
     }
 
-    $installArgs = @("--install", $imageToInstall, "--no-launch")
-    if ($targetDistro -ne $imageToInstall) {
-        $installArgs = @("--install", $imageToInstall, "--name", $targetDistro, "--no-launch")
+    $installedDistros = Get-InstalledWslDistros
+    $targetDistro = $Distro
+    $provisionedNewDistro = $false
+    $effectiveLinuxUser = $null
+
+    if (-not $targetDistro) {
+        if ($installedDistros.Count -gt 0) {
+            $targetDistro = $installedDistros[0]
+            Write-Info "Using existing default WSL distro: $targetDistro"
+        } else {
+            $targetDistro = $BaseDistro
+        }
     }
 
-    Write-Info "WSL distro '$targetDistro' not found. Installing '$imageToInstall' (non-interactive)..."
-    & wsl.exe @installArgs
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to install WSL distro '$imageToInstall' (exit code $LASTEXITCODE)."
-        Write-Warn "If this is a brand-new Windows machine enabling WSL for the first time, reboot Windows and re-run the same command."
-        exit $LASTEXITCODE
-    }
+    # 3. Auto-install target distro if it is not installed yet
+    if ($installedDistros -notcontains $targetDistro) {
+        $onlineDistros = Get-OnlineWslDistros
+        $imageToInstall = $BaseDistro
+        if ($onlineDistros -contains $targetDistro -and -not $env:WSL_BASE_DISTRO -and -not $PSBoundParameters.ContainsKey('BaseDistro')) {
+            $imageToInstall = $targetDistro
+        }
 
-    $installedAfter = Get-InstalledWslDistros
-    if ($installedAfter -notcontains $targetDistro) {
-        Write-Warn "WSL installed '$targetDistro', but a Windows reboot may be required before it can start. Reboot and re-run this command."
-        exit 1
-    }
+        if ($isDryRun) {
+            if ($targetDistro -ne $imageToInstall) {
+                Write-Info "[DRY-RUN] Would run: wsl.exe --install $imageToInstall --name $targetDistro --no-launch"
+            } else {
+                Write-Info "[DRY-RUN] Would run: wsl.exe --install $imageToInstall --no-launch"
+            }
+            Write-Info "[DRY-RUN] Would bootstrap Linux user '$(Resolve-LinuxUsername $LinuxUser)' and run install.sh."
+            return 0
+        }
 
-    $provisionedNewDistro = $true
-    $effectiveLinuxUser = Resolve-LinuxUsername $LinuxUser
-    Write-Info "Bootstrapping non-root Linux user '$effectiveLinuxUser' inside '$targetDistro'..."
+        $installArgs = @("--install", $imageToInstall, "--no-launch")
+        if ($targetDistro -ne $imageToInstall) {
+            $installArgs = @("--install", $imageToInstall, "--name", $targetDistro, "--no-launch")
+        }
 
-    $bootstrapScript = @'
+        Write-Info "WSL distro '$targetDistro' not found. Installing '$imageToInstall' (non-interactive)..."
+        $distroExit = Invoke-WslStream $installArgs
+        if ($distroExit -ne 0 -and $distroExit -ne 3010) {
+            Write-Err "Failed to install WSL distro '$imageToInstall' (exit code $distroExit)."
+            Write-Warn "If Windows just enabled WSL for the first time, reboot Windows and re-run this exact same command."
+            return $distroExit
+        }
+
+        $installedAfter = Get-InstalledWslDistros
+        if ($installedAfter -notcontains $targetDistro) {
+            Write-Warn "WSL installed '$targetDistro', but a Windows reboot is required before it can start. Reboot and re-run this command."
+            return 0
+        }
+
+        $provisionedNewDistro = $true
+        $effectiveLinuxUser = Resolve-LinuxUsername $LinuxUser
+        Write-Info "Bootstrapping non-root Linux user '$effectiveLinuxUser' inside '$targetDistro'..."
+
+        $bootstrapScript = @'
 set -euo pipefail
 TARGET_USER="$1"
 if ! id -u "$TARGET_USER" >/dev/null 2>&1; then
@@ -219,79 +295,87 @@ systemd=true
 EOF
 '@ -replace "`r`n", "`n"
 
-    $bootstrapScript | & wsl.exe -d $targetDistro -u root -- bash -s -- $effectiveLinuxUser
-    if ($LASTEXITCODE -ne 0) {
-        Write-Err "Failed to bootstrap Linux user '$effectiveLinuxUser' in '$targetDistro'."
-        exit $LASTEXITCODE
+        $bootExit = Invoke-WslStream @("-d", $targetDistro, "-u", "root", "--", "bash", "-s", "--", $effectiveLinuxUser) $bootstrapScript
+        if ($bootExit -ne 0) {
+            Write-Err "Failed to bootstrap Linux user '$effectiveLinuxUser' in '$targetDistro' (exit code $bootExit)."
+            return $bootExit
+        }
+
+        # Terminate once so /etc/wsl.conf default user & systemd take effect cleanly
+        [void](Invoke-WslCapture @("--terminate", $targetDistro))
+        Write-Ok "WSL distro '$targetDistro' is ready (default user: $effectiveLinuxUser)."
+    } else {
+        Write-Info "Using existing WSL distro: $targetDistro"
     }
 
-    # Terminate once so /etc/wsl.conf default user & systemd take effect cleanly
-    & wsl.exe --terminate $targetDistro 2>$null | Out-Null
-    Write-Ok "WSL distro '$targetDistro' is ready (default user: $effectiveLinuxUser)."
-} else {
-    Write-Info "Using existing WSL distro: $targetDistro"
-}
+    # 4. Build environment arguments passed safely to WSL `env`
+    $envArgs = @(
+        "TRYTON_SERIES=$TrytonSeries",
+        "TRYTON_PORT=$TrytonPort",
+        "PG_USER=$PgUser",
+        "PG_DB=$PgDb"
+    )
+    if ($null -ne $PgPort)    { $envArgs += "PG_PORT=$PgPort" }
+    if ($InstallDir)          { $envArgs += "INSTALL_DIR=$InstallDir" }
+    if ($DataDir)             { $envArgs += "DATA_DIR=$DataDir" }
+    if ($PgHost)              { $envArgs += "PG_HOST=$PgHost" }
+    if ($PgPassword)          { $envArgs += "PG_PASSWORD=$PgPassword" }
+    if ($TrytonAdminEmail)    { $envArgs += "TRYTON_ADMIN_EMAIL=$TrytonAdminEmail" }
+    if ($TrytonAdminPassword) { $envArgs += "TRYTON_ADMIN_PASSWORD=$TrytonAdminPassword" }
+    if ($TrytonLang)          { $envArgs += "TRYTON_LANG=$TrytonLang" }
+    if ($TrytonExtraModules)  { $envArgs += "TRYTON_EXTRA_MODULES=$TrytonExtraModules" }
+    if ($SkipApt -or $env:SKIP_APT -eq "1") { $envArgs += "SKIP_APT=1" }
+    if ($isDryRun)                          { $envArgs += "DRY_RUN=1" }
 
-# 4. Build environment arguments passed safely to WSL `env`
-$envArgs = @(
-    "TRYTON_SERIES=$TrytonSeries",
-    "TRYTON_PORT=$TrytonPort",
-    "PG_USER=$PgUser",
-    "PG_DB=$PgDb"
-)
-if ($null -ne $PgPort)    { $envArgs += "PG_PORT=$PgPort" }
-if ($InstallDir)          { $envArgs += "INSTALL_DIR=$InstallDir" }
-if ($DataDir)             { $envArgs += "DATA_DIR=$DataDir" }
-if ($PgHost)              { $envArgs += "PG_HOST=$PgHost" }
-if ($PgPassword)          { $envArgs += "PG_PASSWORD=$PgPassword" }
-if ($TrytonAdminEmail)    { $envArgs += "TRYTON_ADMIN_EMAIL=$TrytonAdminEmail" }
-if ($TrytonAdminPassword) { $envArgs += "TRYTON_ADMIN_PASSWORD=$TrytonAdminPassword" }
-if ($TrytonLang)          { $envArgs += "TRYTON_LANG=$TrytonLang" }
-if ($TrytonExtraModules)  { $envArgs += "TRYTON_EXTRA_MODULES=$TrytonExtraModules" }
-if ($SkipApt -or $env:SKIP_APT -eq "1") { $envArgs += "SKIP_APT=1" }
-if ($DryRun  -or $env:DRY_RUN  -eq "1") { $envArgs += "DRY_RUN=1" }
-
-$wslPrefix = @("-d", $targetDistro)
-if ($effectiveLinuxUser) {
-    $wslPrefix += @("-u", $effectiveLinuxUser)
-}
-
-# 5. Obtain install.sh content (from local file for testing, or over HTTPS from GitHub)
-if ($LocalScript) {
-    if (-not (Test-Path -LiteralPath $LocalScript)) {
-        Write-Err "LocalScript not found: $LocalScript"
-        exit 1
+    $wslPrefix = @("-d", $targetDistro)
+    if ($effectiveLinuxUser) {
+        $wslPrefix += @("-u", $effectiveLinuxUser)
     }
-    Write-Info "Running local installer script inside '$targetDistro': $LocalScript"
-    $scriptContent = (Get-Content -LiteralPath $LocalScript -Raw) -replace "`r`n", "`n"
-} else {
-    if ($RepoUrl -notmatch '^https://') {
-        Write-Err "RepoUrl must use HTTPS."
-        exit 1
+
+    # 5. Obtain install.sh content (from local file for testing, or over HTTPS from GitHub)
+    if ($LocalScript) {
+        if (-not (Test-Path -LiteralPath $LocalScript)) {
+            Write-Err "LocalScript not found: $LocalScript"
+            return 1
+        }
+        Write-Info "Running local installer script inside '$targetDistro': $LocalScript"
+        $scriptContent = (Get-Content -LiteralPath $LocalScript -Raw) -replace "`r`n", "`n"
+    } else {
+        if ($RepoUrl -notmatch '^https://') {
+            Write-Err "RepoUrl must use HTTPS."
+            return 1
+        }
+        Write-Info "Downloading installer from $RepoUrl..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $scriptContent = (Invoke-RestMethod -Uri $RepoUrl) -replace "`r`n", "`n"
     }
-    Write-Info "Downloading installer from $RepoUrl..."
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $scriptContent = (Invoke-RestMethod -Uri $RepoUrl) -replace "`r`n", "`n"
+
+    # 6. Execute install.sh inside WSL (piped via stdin so paths and CRLF never break)
+    $wslArgs = $wslPrefix + @("--", "env") + $envArgs + @("bash", "-s")
+    $runExit = Invoke-WslStream $wslArgs $scriptContent
+    if ($runExit -ne 0) {
+        Write-Err "Tryton installation inside WSL distro '$targetDistro' failed (exit code $runExit)."
+        return $runExit
+    }
+
+    Write-Ok "Tryton installation finished in WSL distro '$targetDistro'!"
+    Write-Host "  View credentials:  wsl -d $targetDistro -- cat ~/tryton/.credentials" -ForegroundColor Gray
+    Write-Host "  Start Tryton:      wsl -d $targetDistro -- ~/tryton/start.sh" -ForegroundColor Gray
+    if ($provisionedNewDistro) {
+        Write-Host "  Remove test distro later:  wsl --unregister $targetDistro" -ForegroundColor Gray
+    }
+
+    if ($StartServer -and -not $isDryRun) {
+        $targetDir = if ($InstallDir) { $InstallDir } else { '$HOME/tryton' }
+        Write-Info "Starting Tryton server in '$targetDistro' (open http://localhost:$TrytonPort in your browser)..."
+        $startArgs = $wslPrefix + @("--", "bash", "-lc", "exec `"$targetDir/start.sh`"")
+        return (Invoke-WslStream $startArgs)
+    }
+
+    return 0
 }
 
-# 6. Execute install.sh inside WSL (piped via stdin so paths and CRLF never break)
-$wslArgs = $wslPrefix + @("--", "env") + $envArgs + @("bash", "-s")
-$scriptContent | & wsl.exe @wslArgs
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Tryton installation inside WSL distro '$targetDistro' failed (exit code $LASTEXITCODE)."
-    exit $LASTEXITCODE
-}
-
-Write-Ok "Tryton installation finished in WSL distro '$targetDistro'!"
-Write-Host "  View credentials:  wsl -d $targetDistro -- cat ~/tryton/.credentials" -ForegroundColor Gray
-Write-Host "  Start Tryton:      wsl -d $targetDistro -- ~/tryton/start.sh" -ForegroundColor Gray
-if ($provisionedNewDistro) {
-    Write-Host "  Remove test distro later:  wsl --unregister $targetDistro" -ForegroundColor Gray
-}
-
-if ($StartServer -and -not $DryRun) {
-    $targetDir = if ($InstallDir) { $InstallDir } else { '$HOME/tryton' }
-    Write-Info "Starting Tryton server in '$targetDistro' (open http://localhost:$TrytonPort in your browser)..."
-    $startArgs = $wslPrefix + @("--", "bash", "-lc", "exec `"$targetDir/start.sh`"")
-    & wsl.exe @startArgs
+$__exitCode = Invoke-TrytonWslMain
+if ($PSCommandPath) {
+    exit $__exitCode
 }
