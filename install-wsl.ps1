@@ -147,7 +147,7 @@ function Install-WslViaDismAndMsi {
         }
 
         $sig = Get-AuthenticodeSignature -FilePath $msiPath
-        if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notlike "*Microsoft*") {
+        if ($sig.Status -ne "Valid" -or -not $sig.SignerCertificate -or $sig.SignerCertificate.Subject -notlike "*Microsoft*") {
             Write-Err "Downloaded WSL MSI failed Microsoft Authenticode signature verification ($($sig.Status))."
             return [PSCustomObject]@{ Success = $false; RebootRequired = $rebootRequired; ExitCode = 1 }
         }
@@ -167,6 +167,81 @@ function Install-WslViaDismAndMsi {
     }
 
     return [PSCustomObject]@{ Success = $true; RebootRequired = $rebootRequired; ExitCode = 0 }
+}
+
+function Invoke-ElevatedWslBootstrap {
+    # Launches an elevated PowerShell via standard Windows UAC (-Verb RunAs) ONLY for enabling WSL.
+    $tempScript = Join-Path $env:TEMP ("tryton-wsl-enable-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    $elevBody = @'
+$ErrorActionPreference = "Continue"
+$rebootRequired = $false
+Write-Host "[INFO] Enabling Windows Subsystem for Linux..." -ForegroundColor Cyan
+& wsl.exe --install --no-distribution
+$wslExit = $LASTEXITCODE
+if ($wslExit -eq 3010) {
+    $rebootRequired = $true
+} elseif ($wslExit -ne 0) {
+    Write-Host "[INFO] Enabling WSL features via DISM + official Microsoft WSL MSI..." -ForegroundColor Cyan
+    foreach ($feature in @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")) {
+        & dism.exe /online /enable-feature "/featurename:$feature" /all /norestart
+        if ($LASTEXITCODE -eq 3010) {
+            $rebootRequired = $true
+        } elseif ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/WSL/releases/latest" -Headers @{ "User-Agent" = "tryton-wsl-installer" }
+    $asset = $release.assets | Where-Object { $_.name -match "^wsl\..*\.$arch\.msi$" } | Select-Object -First 1
+    if (-not $asset -or $asset.browser_download_url -notmatch '^https://github\.com/microsoft/WSL/releases/download/') {
+        exit 1
+    }
+    $msiPath = Join-Path $env:TEMP $asset.name
+    try {
+        $ProgressPreference = "SilentlyContinue"
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msiPath -UseBasicParsing
+        $sig = Get-AuthenticodeSignature -FilePath $msiPath
+        if ($sig.Status -ne "Valid" -or -not $sig.SignerCertificate -or $sig.SignerCertificate.Subject -notlike "*Microsoft*") {
+            exit 1
+        }
+        $p = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msiPath`"", "/qn", "/norestart") -Wait -PassThru
+        if ($p.ExitCode -eq 3010) {
+            $rebootRequired = $true
+        } elseif ($p.ExitCode -ne 0) {
+            exit $p.ExitCode
+        }
+    } finally {
+        if (Test-Path -LiteralPath $msiPath) { Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+if ($rebootRequired) { exit 3010 }
+exit 0
+'@
+    try {
+        Set-Content -LiteralPath $tempScript -Value $elevBody -Encoding UTF8
+        Write-Info "Requesting Administrator approval (Windows UAC prompt) to install WSL..."
+        try {
+            $proc = Start-Process -FilePath "powershell.exe" `
+                -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$tempScript`"") `
+                -Verb RunAs -Wait -PassThru
+        } catch {
+            Write-Err "Administrator elevation was cancelled or denied."
+            return [PSCustomObject]@{ Success = $false; RebootRequired = $false; ExitCode = 1 }
+        }
+        if ($proc.ExitCode -eq 3010) {
+            return [PSCustomObject]@{ Success = $true; RebootRequired = $true; ExitCode = 0 }
+        }
+        if ($proc.ExitCode -ne 0) {
+            Write-Err "Elevated WSL installation failed (exit code $($proc.ExitCode))."
+            return [PSCustomObject]@{ Success = $false; RebootRequired = $false; ExitCode = $proc.ExitCode }
+        }
+        return [PSCustomObject]@{ Success = $true; RebootRequired = $false; ExitCode = 0 }
+    } finally {
+        if (Test-Path -LiteralPath $tempScript) {
+            Remove-Item -LiteralPath $tempScript -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Test-IsAdministrator {
@@ -192,7 +267,8 @@ function Get-OnlineWslDistros {
     $inTable = $false
     foreach ($line in $res.Lines) {
         $clean = $line.Trim()
-        if ($clean -match '^NAME\s+FRIENDLY NAME') {
+        # Match localized ALL-CAPS table headers (e.g. "NAME  FRIENDLY NAME" or "NOMBRE  NOMBRE DESCRIPTIVO")
+        if (-not $inTable -and $clean -cmatch '^[A-Z\p{Lu}]{3,}\s{2,}[A-Z\p{Lu}]') {
             $inTable = $true
             continue
         }
@@ -274,26 +350,30 @@ function Invoke-TrytonWslMain {
             return 0
         }
 
-        if (-not (Test-IsAdministrator)) {
-            Write-Err "Administrator privileges are required to install WSL for the first time."
-            Write-Host "Right-click PowerShell -> 'Run as Administrator', then re-run this exact same command." -ForegroundColor Yellow
-            return 1
-        }
-
         $rebootNeeded = $false
-        Write-Info "Installing WSL automatically..."
-        $installExit = Invoke-WslStream @("--install", "--no-distribution")
-        if ($installExit -eq 3010) {
-            $rebootNeeded = $true
-        } elseif ($installExit -ne 0) {
-            # Older Windows inbox wsl.exe stubs reject --no-distribution; fall back to DISM + official Microsoft WSL MSI.
-            Write-Warn "Inbox wsl.exe stub did not accept --no-distribution; installing WSL via DISM + official Microsoft WSL MSI..."
-            $fallback = Install-WslViaDismAndMsi
-            if (-not $fallback.Success) {
-                return $fallback.ExitCode
+        if (-not (Test-IsAdministrator)) {
+            $elev = Invoke-ElevatedWslBootstrap
+            if (-not $elev.Success) {
+                return $elev.ExitCode
             }
-            if ($fallback.RebootRequired) {
+            if ($elev.RebootRequired) {
                 $rebootNeeded = $true
+            }
+        } else {
+            Write-Info "Installing WSL automatically..."
+            $installExit = Invoke-WslStream @("--install", "--no-distribution")
+            if ($installExit -eq 3010) {
+                $rebootNeeded = $true
+            } elseif ($installExit -ne 0) {
+                # Older Windows inbox wsl.exe stubs reject --no-distribution; fall back to DISM + official Microsoft WSL MSI.
+                Write-Warn "Inbox wsl.exe stub did not accept --no-distribution; installing WSL via DISM + official Microsoft WSL MSI..."
+                $fallback = Install-WslViaDismAndMsi
+                if (-not $fallback.Success) {
+                    return $fallback.ExitCode
+                }
+                if ($fallback.RebootRequired) {
+                    $rebootNeeded = $true
+                }
             }
         }
 
@@ -308,7 +388,7 @@ function Invoke-TrytonWslMain {
         Write-Ok "WSL is installed and ready!"
     }
 
-    $installedDistros = Get-InstalledWslDistros
+    $installedDistros = @(Get-InstalledWslDistros)
     $targetDistro = $Distro
     $provisionedNewDistro = $false
     $effectiveLinuxUser = $null
@@ -324,7 +404,7 @@ function Invoke-TrytonWslMain {
 
     # 3. Auto-install target distro if it is not installed yet
     if ($installedDistros -notcontains $targetDistro) {
-        $onlineDistros = Get-OnlineWslDistros
+        $onlineDistros = @(Get-OnlineWslDistros)
         $imageToInstall = $BaseDistro
         if ($onlineDistros -contains $targetDistro -and -not $env:WSL_BASE_DISTRO -and -not $PSBoundParameters.ContainsKey('BaseDistro')) {
             $imageToInstall = $targetDistro
@@ -353,7 +433,7 @@ function Invoke-TrytonWslMain {
             return $distroExit
         }
 
-        $installedAfter = Get-InstalledWslDistros
+        $installedAfter = @(Get-InstalledWslDistros)
         if ($installedAfter -notcontains $targetDistro) {
             Write-Warn "WSL installed '$targetDistro', but a Windows reboot is required before it can start. Reboot and re-run this command."
             return 0
