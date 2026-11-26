@@ -56,12 +56,25 @@ function Write-Ok([string]$Msg)   { Write-Host "[ OK ] $Msg" -ForegroundColor Gr
 function Write-Warn([string]$Msg) { Write-Host "[WARN] $Msg" -ForegroundColor Yellow }
 function Write-Err([string]$Msg)  { Write-Host "[ERR ] $Msg" -ForegroundColor Red }
 
+function Get-WslExePath {
+    $modern = Join-Path $env:ProgramFiles "WSL\wsl.exe"
+    if (Test-Path -LiteralPath $modern) {
+        return $modern
+    }
+    $cmd = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+    return $null
+}
+
 function Invoke-WslCapture([string[]]$Arguments) {
+    $wslExe = Get-WslExePath
     # PowerShell 5.1 throws NativeCommandError on stderr redirects when ErrorActionPreference=Stop.
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $output = (& wsl.exe @Arguments 2>&1)
+        $output = (& $wslExe @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref
@@ -75,18 +88,85 @@ function Invoke-WslCapture([string[]]$Arguments) {
 }
 
 function Invoke-WslStream([string[]]$Arguments, [string]$StdinText = $null) {
+    $wslExe = Get-WslExePath
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
         if ($null -ne $StdinText) {
-            $StdinText | & wsl.exe @Arguments
+            $StdinText | & $wslExe @Arguments
         } else {
-            & wsl.exe @Arguments
+            & $wslExe @Arguments
         }
         return $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref
     }
+}
+
+function Install-WslViaDismAndMsi {
+    $rebootRequired = $false
+
+    Write-Info "Enabling required Windows features (Microsoft-Windows-Subsystem-Linux & VirtualMachinePlatform)..."
+    foreach ($feature in @("Microsoft-Windows-Subsystem-Linux", "VirtualMachinePlatform")) {
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & dism.exe /online /enable-feature "/featurename:$feature" /all /norestart | Out-Host
+            $dismExit = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevPref
+        }
+        if ($dismExit -eq 3010) {
+            $rebootRequired = $true
+        } elseif ($dismExit -ne 0) {
+            Write-Err "dism.exe failed enabling '$feature' (exit code $dismExit)."
+            return [PSCustomObject]@{ Success = $false; RebootRequired = $false; ExitCode = $dismExit }
+        }
+    }
+
+    # Download and silently install the latest official Microsoft WSL MSI from GitHub
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+    Write-Info "Downloading latest official Microsoft WSL ($arch) installer from GitHub..."
+
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/WSL/releases/latest" -Headers @{ "User-Agent" = "tryton-wsl-installer" }
+    $asset = $release.assets | Where-Object { $_.name -match "^wsl\..*\.$arch\.msi$" } | Select-Object -First 1
+    if (-not $asset -or $asset.browser_download_url -notmatch '^https://github\.com/microsoft/WSL/releases/download/') {
+        Write-Err "Could not locate official Microsoft WSL .$arch.msi release asset."
+        return [PSCustomObject]@{ Success = $false; RebootRequired = $rebootRequired; ExitCode = 1 }
+    }
+
+    $msiPath = Join-Path $env:TEMP $asset.name
+    try {
+        $prevProgress = $ProgressPreference
+        $ProgressPreference = "SilentlyContinue"
+        try {
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msiPath -UseBasicParsing
+        } finally {
+            $ProgressPreference = $prevProgress
+        }
+
+        $sig = Get-AuthenticodeSignature -FilePath $msiPath
+        if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notlike "*Microsoft*") {
+            Write-Err "Downloaded WSL MSI failed Microsoft Authenticode signature verification ($($sig.Status))."
+            return [PSCustomObject]@{ Success = $false; RebootRequired = $rebootRequired; ExitCode = 1 }
+        }
+
+        Write-Info "Installing $($asset.name)..."
+        $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList @("/i", "`"$msiPath`"", "/qn", "/norestart") -Wait -PassThru
+        if ($proc.ExitCode -eq 3010) {
+            $rebootRequired = $true
+        } elseif ($proc.ExitCode -ne 0) {
+            Write-Err "WSL MSI installation failed (exit code $($proc.ExitCode))."
+            return [PSCustomObject]@{ Success = $false; RebootRequired = $rebootRequired; ExitCode = $proc.ExitCode }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $msiPath) {
+            Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return [PSCustomObject]@{ Success = $true; RebootRequired = $rebootRequired; ExitCode = 0 }
 }
 
 function Test-IsAdministrator {
@@ -180,7 +260,7 @@ function Invoke-TrytonWslMain {
     }
 
     # 2. Verify WSL is installed (and auto-install it on clean Windows machines)
-    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+    if (-not (Get-WslExePath)) {
         Write-Err "wsl.exe was not found on this Windows machine (requires Windows 10 2004+ or Windows 11)."
         return 1
     }
@@ -190,7 +270,7 @@ function Invoke-TrytonWslMain {
     if ($status.ExitCode -ne 0) {
         Write-Warn "Windows Subsystem for Linux (WSL) is not installed yet on this machine."
         if ($isDryRun) {
-            Write-Info "[DRY-RUN] Would run: wsl.exe --install --no-distribution"
+            Write-Info "[DRY-RUN] Would install WSL (via wsl.exe --install --no-distribution or DISM + official Microsoft WSL MSI)."
             return 0
         }
 
@@ -200,16 +280,25 @@ function Invoke-TrytonWslMain {
             return 1
         }
 
-        Write-Info "Installing WSL automatically (wsl.exe --install --no-distribution)..."
+        $rebootNeeded = $false
+        Write-Info "Installing WSL automatically..."
         $installExit = Invoke-WslStream @("--install", "--no-distribution")
-        if ($installExit -ne 0 -and $installExit -ne 3010) {
-            Write-Err "WSL installation returned exit code $installExit."
-            Write-Host "Try running 'wsl.exe --install --no-distribution' manually as Administrator, reboot, and re-run this command." -ForegroundColor Yellow
-            return $installExit
+        if ($installExit -eq 3010) {
+            $rebootNeeded = $true
+        } elseif ($installExit -ne 0) {
+            # Older Windows inbox wsl.exe stubs reject --no-distribution; fall back to DISM + official Microsoft WSL MSI.
+            Write-Warn "Inbox wsl.exe stub did not accept --no-distribution; installing WSL via DISM + official Microsoft WSL MSI..."
+            $fallback = Install-WslViaDismAndMsi
+            if (-not $fallback.Success) {
+                return $fallback.ExitCode
+            }
+            if ($fallback.RebootRequired) {
+                $rebootNeeded = $true
+            }
         }
 
         $after = Invoke-WslCapture @("--status")
-        if ($after.ExitCode -ne 0) {
+        if ($rebootNeeded -or $after.ExitCode -ne 0) {
             Write-Ok "WSL has been installed!"
             Write-Warn "Windows requires a reboot to finish enabling WSL2."
             Write-Host "Please reboot Windows, then re-run this exact same command to install $BaseDistro and Tryton." -ForegroundColor Yellow
