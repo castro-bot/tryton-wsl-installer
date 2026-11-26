@@ -98,27 +98,39 @@ When using the default local WSL PostgreSQL mode, WSL2 automatically forwards `l
 
 ---
 
-## Testing Safely Before Pushing (Throwaway WSL Distro)
+## Testing Safely in a Throwaway WSL Distro (Fully Automatic)
 
-1. In Windows PowerShell, install or import a separate Ubuntu distro (e.g. `Ubuntu-22.04`):
-   ```powershell
-   wsl --install -d Ubuntu-22.04
-   ```
-   *(Finish creating the Linux username/password in the new window, then close it.)*
+`install-wsl.ps1` **automatically installs the WSL distro if it does not exist yet** (using `--no-launch` + automatic Linux user setup, with zero popups):
 
-2. Run `install-wsl.ps1` pointing to that throwaway distro and your local `install.sh`:
-   ```powershell
-   \\wsl.localhost\Ubuntu\home\a\code\tryton-wsl-installer\install-wsl.ps1 `
-     -Distro Ubuntu-22.04 `
-     -LocalScript \\wsl.localhost\Ubuntu\home\a\code\tryton-wsl-installer\install.sh `
-     -TrytonPort 8001 `
-     -StartServer
-   ```
-   *(Use `-TrytonPort 8001` if port `8000` is in use, or `-PgPort 5433` if your primary WSL Ubuntu already has PostgreSQL listening on `5432`.)*
+### Option A — Install a different Ubuntu version directly (e.g. `Ubuntu-22.04` or `Ubuntu-26.04`)
 
-3. Open **http://localhost:8001** in your browser and verify Tryton `sao` loads and logs in with the credentials in `~/tryton/.credentials`.
+```powershell
+$env:WSL_DISTRO = "Ubuntu-22.04"; $env:TRYTON_PORT = "8001"; irm https://raw.githubusercontent.com/castro-bot/tryton-wsl-installer/main/install-wsl.ps1 | iex
+```
 
-4. Remove the throwaway distro when done:
-   ```powershell
-   wsl --unregister Ubuntu-22.04
-   ```
+### Option B — Install a custom-named throwaway copy of any Ubuntu version (e.g. `Ubuntu-24.04`)
+
+```powershell
+$env:WSL_BASE_DISTRO = "Ubuntu-24.04"; $env:WSL_DISTRO = "Ubuntu-Tryton-Test"; $env:TRYTON_PORT = "8001"; irm https://raw.githubusercontent.com/castro-bot/tryton-wsl-installer/main/install-wsl.ps1 | iex
+```
+
+Then start Tryton and view credentials:
+
+```powershell
+wsl -d Ubuntu-Tryton-Test -- cat ~/tryton/.credentials
+wsl -d Ubuntu-Tryton-Test -- ~/tryton/start.sh
+```
+
+Open **http://localhost:8001** in your browser. When finished testing, remove the throwaway distro:
+
+```powershell
+wsl --unregister Ubuntu-Tryton-Test
+```
+
+### PowerShell-only Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `WSL_BASE_DISTRO` | `Ubuntu-24.04` | Ubuntu/Debian image to install when the target distro does not exist yet (line 22 of `install-wsl.ps1`) |
+| `WSL_DISTRO` | *(existing default or `WSL_BASE_DISTRO`)* | Target WSL distro name; automatically installed if missing |
+| `WSL_USER` | *(Windows username or `tryton`)* | Non-root Linux user created when provisioning a brand-new distro |
